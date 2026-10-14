@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net/http"
 	"os"
@@ -12,33 +13,58 @@ import (
 	"golang-skill-test/internal/jobs"
 )
 
+const shutdownTimeout = 5 * time.Second
+
 func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
 	service := jobs.NewService(2, 4)
 	mux := http.NewServeMux()
 	jobs.RegisterHandlers(mux, service)
 
 	server := &http.Server{
-		Addr:    ":8080",
-		Handler: mux,
+		Addr:              ":8080",
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	serverErr := make(chan error, 1)
 	go func() {
 		log.Printf("server listening on %s", server.Addr)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("server error: %v", err)
-		}
+		serverErr <- server.ListenAndServe()
 	}()
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	<-sigCh
+	var runErr error
+	select {
+	case err := <-serverErr:
+		// Listener failed (e.g. port in use): still stop the workers.
+		if !errors.Is(err, http.ErrServerClosed) {
+			runErr = err
+		}
+	case <-ctx.Done():
+		log.Print("shutting down")
+	}
 
-	ctx, cancel := signalContext()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
-	_ = server.Shutdown(ctx)
-	service.Stop()
-}
 
-func signalContext() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), 5*time.Second)
+	// Stop accepting HTTP requests first, then drain the job queue within
+	// the remaining budget.
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("http shutdown: %v", err)
+	}
+	if err := service.Shutdown(shutdownCtx); err != nil {
+		log.Printf("job service shutdown: %v (unfinished jobs were cancelled)", err)
+	}
+	return runErr
 }
